@@ -6,6 +6,7 @@ from firebase_admin import credentials, messaging
 from pathlib import Path
 import os
 import sqlite3
+import json
 
 # -----------------------------------------
 # Paths
@@ -13,15 +14,22 @@ import sqlite3
 BASE_DIR = Path(__file__).resolve().parent.parent  # /app
 CONFIG_DIR = BASE_DIR / "config"
 DB_PATH = BASE_DIR / "secure" / "aurumra.db"
-FIREBASE_KEY_PATH = CONFIG_DIR / "firebase-key.json"
 
 # -----------------------------------------
-# Initialize Firebase Admin
+# Initialize Firebase Admin (Using ENV VAR)
 # -----------------------------------------
-if not FIREBASE_KEY_PATH.exists():
-    raise FileNotFoundError(f"Firebase key not found: {FIREBASE_KEY_PATH}")
 
-cred = credentials.Certificate(str(FIREBASE_KEY_PATH))
+firebase_key_raw = os.getenv("FIREBASE_SERVICE_ACCOUNT")
+
+if not firebase_key_raw:
+    raise Exception("❌ ERROR: FIREBASE_SERVICE_ACCOUNT env variable missing!")
+
+try:
+    firebase_key_dict = json.loads(firebase_key_raw)
+except Exception as e:
+    raise Exception(f"❌ ERROR: Unable to parse FIREBASE_SERVICE_ACCOUNT JSON → {e}")
+
+cred = credentials.Certificate(firebase_key_dict)
 
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
@@ -88,7 +96,7 @@ def broadcast_transaction_notification(title, message, data=None):
         print("⚠️ No devices registered.")
         return {"sent": 0}
 
-    # Split into batches of 1000
+    # Split into batches of 500
     batch_size = 500
     batches = [tokens[i:i + batch_size] for i in range(0, len(tokens), batch_size)]
 

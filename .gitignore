@@ -1,0 +1,29 @@
+# Environment & Secrets
+config/.env
+config/firebase-key.json
+secure/
+*.log
+
+# Databases
+*.db
+database/
+aurumra_wallet.db
+
+# Python cache
+__pycache__/
+services/__pycache__/
+
+# Listener state files
+secure/*.json
+
+# OS / Editor junk
+*.DS_Store
+Thumbs.db
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Node files
+node_modules/

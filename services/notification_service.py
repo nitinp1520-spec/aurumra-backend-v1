@@ -20,18 +20,22 @@ DB_PATH = SECURE_DIR / "aurumra.db"
 
 SECURE_DIR.mkdir(exist_ok=True)
 
-# -------------------------------------------------------------------
-# Load Service Account JSON (firebase-key.json)
-# -------------------------------------------------------------------
-SERVICE_ACCOUNT_FILE = CONFIG_DIR / "firebase-key.json"
+# Firebase service account key from environment variable
+firebase_key_raw = os.getenv("FIREBASE_SERVICE_ACCOUNT")
 
-if not SERVICE_ACCOUNT_FILE.exists():
-    print("❌ ERROR: firebase-key.json missing in app/config/")
+if not firebase_key_raw:
+    print("❌ ERROR: FIREBASE_SERVICE_ACCOUNT missing in Railway variables")
+    firebase_key = None
 else:
-    print("✅ Firebase Service Account detected.")
+    try:
+        firebase_key = json.loads(firebase_key_raw)
+        print("✅ Firebase Service Account loaded from ENV")
+    except Exception as e:
+        print(f"❌ ERROR: Invalid FIREBASE_SERVICE_ACCOUNT JSON → {e}")
+        firebase_key = None
 
 # Firebase Project ID
-PROJECT_ID = "aurumra-wallet-438d7"
+PROJECT_ID = firebase_key.get("project_id") if firebase_key else None
 
 # OAuth scope for FCM v1
 SCOPES = ["https://www.googleapis.com/auth/firebase.messaging"]

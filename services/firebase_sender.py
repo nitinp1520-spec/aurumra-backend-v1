@@ -1,156 +1,102 @@
-# notification_service.py — Firebase Admin Push Notifications
-# backend/app/services/notification_service.py
+# firebase_sender.py — FCM v1 Sender (HTTPX + Google OAuth)
+# backend/app/services/firebase_sender.py
 
-import firebase_admin
-from firebase_admin import credentials, messaging
-from pathlib import Path
 import os
-import sqlite3
 import json
+import time
+import httpx
+from pathlib import Path
+from typing import Dict, Any
+
+from google.oauth2 import service_account
+from google.auth.transport.requests import Request
 
 # -----------------------------------------
-# Paths
-# -----------------------------------------
-BASE_DIR = Path(__file__).resolve().parent.parent  # /app
-CONFIG_DIR = BASE_DIR / "config"
-DB_PATH = BASE_DIR / "secure" / "aurumra.db"
-
-# -----------------------------------------
-# Initialize Firebase Admin (Using ENV VAR)
+# Load Firebase Service Account JSON (ENV)
 # -----------------------------------------
 
 firebase_key_raw = os.getenv("FIREBASE_SERVICE_ACCOUNT")
 
 if not firebase_key_raw:
-    raise Exception("❌ ERROR: FIREBASE_SERVICE_ACCOUNT env variable missing!")
-
-try:
-    firebase_key_dict = json.loads(firebase_key_raw)
-except Exception as e:
-    raise Exception(f"❌ ERROR: Unable to parse FIREBASE_SERVICE_ACCOUNT JSON → {e}")
-
-cred = credentials.Certificate(firebase_key_dict)
-
-if not firebase_admin._apps:
-    firebase_admin.initialize_app(cred)
-
-
-# =========================================================
-# Device Token System (Stores device tokens)
-# =========================================================
-
-def _db():
-    return sqlite3.connect(DB_PATH)
-
-
-def register_tokens(tokens):
-    """
-    Store FCM tokens for push notifications.
-    Used by /register_device in main.py
-    """
-    if not tokens:
-        return {"registered": 0}
-
-    conn = _db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS device_tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token TEXT UNIQUE
+    print("❌ ERROR: FIREBASE_SERVICE_ACCOUNT missing in Railway variables")
+    firebase_credentials = None
+else:
+    try:
+        service_account_json = json.loads(firebase_key_raw)
+        firebase_credentials = service_account.Credentials.from_service_account_info(
+            service_account_json,
+            scopes=["https://www.googleapis.com/auth/firebase.messaging"],
         )
-    """)
+        print("✅ Firebase Service Account loaded (FCM v1 HTTP)")
+    except Exception as e:
+        firebase_credentials = None
+        print(f"❌ ERROR: Invalid FIREBASE_SERVICE_ACCOUNT JSON → {e}")
 
-    for token in tokens:
-        try:
-            cur.execute("INSERT OR IGNORE INTO device_tokens (token) VALUES (?)", (token,))
-        except Exception:
-            pass
+# -----------------------------------------
+# Token cache (1 hour expiration)
+# -----------------------------------------
+_cached_token: Dict[str, Any] = {
+    "token": None,
+    "expiry": 0
+}
 
-    conn.commit()
-    conn.close()
+def get_access_token() -> str:
+    """Generate or refresh OAuth2 token for FCM v1 API."""
+    global _cached_token
 
-    return {"registered": len(tokens)}
+    now = time.time()
+    if _cached_token["token"] and now < _cached_token["expiry"]:
+        return _cached_token["token"]
+
+    if not firebase_credentials:
+        raise Exception("Firebase credentials missing. Cannot generate token.")
+
+    # Refresh token
+    request = Request()
+    firebase_credentials.refresh(request)
+
+    token = firebase_credentials.token
+    expiry = now + 3500  # ~1 hour
+
+    _cached_token["token"] = token
+    _cached_token["expiry"] = expiry
+
+    return token
 
 
-# =========================================================
-# BROADCAST Push Notifications
-# =========================================================
+# -----------------------------------------
+# Send Notification using FCM v1 REST API
+# -----------------------------------------
+async def send_fcm_http_v1(device_token: str, title: str, body: str, data=None):
+    """Send push notification using Firebase Cloud Messaging v1 API."""
+    if not firebase_credentials:
+        return {"error": "Firebase credentials not loaded"}
 
-def broadcast_transaction_notification(title, message, data=None):
-    """
-    Sends a push notification to ALL device tokens.
-    Called in main.py after a user sends a transaction.
-    """
+    project_id = firebase_credentials.project_id
+    url = f"https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
 
-    conn = _db()
-    cur = conn.cursor()
-
-    cur.execute("SELECT token FROM device_tokens")
-    rows = cur.fetchall()
-    conn.close()
-
-    tokens = [r[0] for r in rows]
-
-    if not tokens:
-        print("⚠️ No devices registered.")
-        return {"sent": 0}
-
-    # Split into batches of 500
-    batch_size = 500
-    batches = [tokens[i:i + batch_size] for i in range(0, len(tokens), batch_size)]
-
-    total_sent = 0
-    failures = 0
-    responses = []
-
-    for batch in batches:
-        multicast = messaging.MulticastMessage(
-            notification=messaging.Notification(
-                title=title,
-                body=message
-            ),
-            data={k: str(v) for k, v in (data or {}).items()},
-            tokens=batch
-        )
-
-        try:
-            result = messaging.send_multicast(multicast)
-            responses.append(result)
-            total_sent += result.success_count
-            failures += result.failure_count
-            print(f"📨 FCM Batch: {result.success_count} sent, {result.failure_count} failed")
-        except Exception as e:
-            print(f"⚠️ Firebase error: {e}")
-
-    return {
-        "sent": total_sent,
-        "failed": failures,
-        "responses": responses
+    headers = {
+        "Authorization": f"Bearer {get_access_token()}",
+        "Content-Type": "application/json; UTF-8",
     }
 
+    message = {
+        "message": {
+            "token": device_token,
+            "notification": {
+                "title": title,
+                "body": body
+            },
+            "data": {k: str(v) for k, v in (data or {}).items()},
+        }
+    }
 
-# =========================================================
-# Topic-based Notification (used by listener.py)
-# =========================================================
+    async with httpx.AsyncClient() as client:
+        r = await client.post(url, headers=headers, json=message)
 
-def send_incoming_tx_notification(address, amount, inr_value):
-    """
-    Used by listener.py → sends push when incoming MATIC arrives.
-    Device must subscribe to /topics/<wallet_address>
-    """
+        if r.status_code >= 400:
+            print("❌ FCM v1 Error →", r.text)
+            return {"error": r.text}
 
-    try:
-        message = messaging.Message(
-            notification=messaging.Notification(
-                title="💰 Incoming Transaction",
-                body=f"You received {amount:.4f} MATIC (≈₹{inr_value:.2f})"
-            ),
-            topic=address.lower()
-        )
-
-        response = messaging.send(message)
-        print(f"📨 Topic Push Sent → {response}")
-
-    except Exception as e:
-        print(f"⚠️ Push Error: {e}")
+        print("📨 FCM v1 Notification Sent →", r.text)
+        return {"success": True, "response": r.json()}
